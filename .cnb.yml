@@ -7,7 +7,7 @@ $:
     - runner:
         cpus: 64
       docker:
-        image: docker.cnb.cool/debug.icu/dev-image/python-3.12:latest
+        image: docker.cnb.cool/debug.icu/dev-image/golang-1.24.0:latest
       imports:
         - https://cnb.cool/debug.icu/secrets/-/blob/main/claude.proxy.yaml
         - https://cnb.cool/debug.icu/secrets/-/blob/main/llm.yaml
