@@ -1,0 +1,78 @@
+# CNB 开发环境配置
+# 环境: python-3.12
+
+$:
+  vscode:
+    - runner:
+        cpus: 64
+      docker:
+        image: docker.cnb.cool/debug.icu/dev-image/python-3.12:latest
+      imports: 
+        - https://cnb.cool/debug.icu/secrets/-/blob/main/claude.proxy.yaml
+        - https://cnb.cool/debug.icu/secrets/-/blob/main/llm.yaml
+      services:
+        - vscode
+        - docker
+      stages:
+        - name: Initialize Claude Code Environment
+          script: |
+            if [ -f "/opt/cnb/scripts/claude-restore.sh" ]; then
+                bash /opt/cnb/scripts/claude-restore.sh
+            else
+                echo "Error: Claude restore script not found"
+                exit 1
+            fi
+
+# # Tag 事件：编译多平台二进制 → 创建 Release → 上传制品 → 推送镜像
+#   tag_push:
+#     - services:
+#         - docker
+#       stages:
+#         - name: build web and multi-platform binaries
+#           image: docker.cnb.cool/debug.icu/dev-image/golang-1.26.0:latest
+#           script: |
+#             make release VERSION="${CNB_BRANCH}"
+
+#         - name: extract release notes
+#           image: docker.cnb.cool/debug.icu/dev-image/golang-1.26.0:latest
+#           script: |
+#             git fetch --tags --unshallow 2>/dev/null || git fetch --tags
+#             PREV_TAG=$(git describe --tags --abbrev=0 "${CNB_BRANCH}^" 2>/dev/null || true)
+#             if [ -n "$PREV_TAG" ]; then
+#               RANGE="${PREV_TAG}..${CNB_BRANCH}"
+#             else
+#               RANGE="${CNB_BRANCH}"
+#             fi
+#             TAG_MSG=$(git log --pretty=format:'- %s' "$RANGE" | perl -ne 'print unless $seen{$_}++')
+#             if [ -z "$TAG_MSG" ]; then
+#               TAG_MSG="Release ${CNB_BRANCH}"
+#             fi
+#             echo "$TAG_MSG" > release_notes.md
+
+#         - name: create release
+#           type: git:release
+#           options:
+#             title: ${CNB_BRANCH}
+#             descriptionFromFile: release_notes.md
+#             latest: true
+
+#         - name: upload release attachments
+#           image: cnbcool/attachments:latest
+#           settings:
+#             attachments:
+#               - "./dist/*"
+
+#         - name: build and push docker image
+#           script: |
+#             IMAGE_NAME="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+#             VERSION="${CNB_BRANCH}"
+
+#             cp "dist/pane-${VERSION}-linux-amd64" pane
+#             mkdir -p downloads
+#             cp dist/pane-${VERSION}-* downloads/
+#             docker build -t "${IMAGE_NAME}:${VERSION}" -t "${IMAGE_NAME}:latest" .
+
+#             docker push "${IMAGE_NAME}:${VERSION}"
+#             docker push "${IMAGE_NAME}:latest"
+
+#             echo "✓ Pushed ${IMAGE_NAME}:${VERSION} and ${IMAGE_NAME}:latest"            
