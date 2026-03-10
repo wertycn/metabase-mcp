@@ -1,18 +1,6 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-*.egg-info/
+# Go build artifacts
+metabase-mcp
 dist/
-build/
-.eggs/
-
-# Virtual environments
-.venv/
-venv/
-env/
 
 # Environment / secrets
 .env
@@ -31,6 +19,3 @@ env/
 # OS
 .DS_Store
 Thumbs.db
-
-# uv
-uv.lock

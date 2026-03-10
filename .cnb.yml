@@ -1,13 +1,12 @@
-# CNB 流水线配置
-# 环境: python-3.12
+# CNB 云原生开发环境配置
 
 # ── 开发环境 (VS Code) ────────────────────────────────────────────────────────
 $:
   vscode:
     - runner:
-        cpus: 64
+        cpus: 32
       docker:
-        image: docker.cnb.cool/debug.icu/dev-image/golang-1.24.0:latest
+        image: docker.cnb.cool/debug.icu/dev-image/golang-1.26.0:latest
       imports:
         - https://cnb.cool/debug.icu/secrets/-/blob/main/claude.proxy.yaml
         - https://cnb.cool/debug.icu/secrets/-/blob/main/llm.yaml
@@ -20,23 +19,29 @@ $:
             if [ -f "/opt/cnb/scripts/claude-restore.sh" ]; then
                 bash /opt/cnb/scripts/claude-restore.sh
             else
-                echo "Error: Claude restore script not found"
-                exit 1
+                echo "Warning: Claude restore script not found"
             fi
 
-# ── Tag 事件：构建镜像 → 导出附件 → 创建 Release → 推送镜像 ─────────────────
+        - name: Export environment URIs
+          script: |
+            env | grep PROXY | grep URI > cnb.uri
+
+        - name: Install dependencies
+          script: |
+            make install-deps
+
+# ── Tag 事件：多平台编译 → 创建 Release → 上传制品 → 构建并推送镜像 ──────────
   tag_push:
     - services:
         - docker
       stages:
-        - name: Build and export Docker image
+        - name: Build multi-platform binaries
+          image: docker.cnb.cool/debug.icu/dev-image/golang-1.26.0:latest
           script: |
-            IMAGE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
-            docker build -t "${IMAGE}:${CNB_BRANCH}" -t "${IMAGE}:latest" .
-            docker save "${IMAGE}:${CNB_BRANCH}" | gzip > "metabase-mcp-${CNB_BRANCH}.tar.gz"
-            ls -lh "metabase-mcp-${CNB_BRANCH}.tar.gz"
+            make release VERSION="${CNB_BRANCH}"
 
-        - name: Generate release notes
+        - name: Extract release notes
+          image: docker.cnb.cool/debug.icu/dev-image/golang-1.26.0:latest
           script: |
             git fetch --tags --unshallow 2>/dev/null || git fetch --tags
             PREV_TAG=$(git describe --tags --abbrev=0 "${CNB_BRANCH}^" 2>/dev/null || true)
@@ -45,8 +50,8 @@ $:
             else
               RANGE="${CNB_BRANCH}"
             fi
-            NOTES=$(git log --pretty=format:'- %s' "$RANGE" | perl -ne 'print unless $seen{$_}++')
-            echo "${NOTES:-Release ${CNB_BRANCH}}" > release_notes.md
+            TAG_MSG=$(git log --pretty=format:'- %s' "$RANGE" | perl -ne 'print unless $seen{$_}++')
+            echo "${TAG_MSG:-Release ${CNB_BRANCH}}" > release_notes.md
 
         - name: Create Release
           type: git:release
@@ -55,14 +60,39 @@ $:
             descriptionFromFile: release_notes.md
             latest: true
 
-        - name: Upload image artifact to Release
+        - name: Upload release attachments
           image: cnbcool/attachments:latest
           settings:
             attachments:
-              - "metabase-mcp-*.tar.gz"
+              - "./dist/*"
 
-        - name: Push Docker image
+        - name: Build and push Docker image
           script: |
             IMAGE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
-            docker push "${IMAGE}:${CNB_BRANCH}"
+            VERSION="${CNB_BRANCH}"
+
+            cp "dist/metabase-mcp-${VERSION}-linux-amd64" metabase-mcp
+            docker build -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" .
+
+            docker push "${IMAGE}:${VERSION}"
             docker push "${IMAGE}:latest"
+
+            echo "✓ Pushed ${IMAGE}:${VERSION} and ${IMAGE}:latest"
+
+# ── main 分支推送：测试 → 编译 → 构建镜像（不推送）─────────────────────────
+main:
+  push:
+    - services:
+        - docker
+      stages:
+        - name: Test and build
+          image: docker.cnb.cool/debug.icu/dev-image/golang-1.26.0:latest
+          script: |
+            make build test
+
+        - name: Build Docker image
+          script: |
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+              go build -ldflags="-s -w" -o metabase-mcp .
+            docker build -t metabase-mcp:test .
+            echo "✓ Docker image built successfully (not pushed)"
