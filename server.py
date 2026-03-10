@@ -635,6 +635,208 @@ async def get_dashboard(dashboard_id: int, ctx: Context) -> dict[str, Any]:
     return await _get_client().request("GET", f"/dashboard/{dashboard_id}")
 
 
+@mcp.tool
+async def create_dashboard(
+    name: str,
+    ctx: Context,
+    description: str | None = None,
+    collection_id: int | None = None,
+    parameters: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """
+    Create a new dashboard in Metabase.
+
+    Args:
+        name: Dashboard display name.
+        description: Optional description.
+        collection_id: Optional collection to place the dashboard in.
+        parameters: Optional list of dashboard filter parameter definitions.
+    """
+    await ctx.info(f"Creating dashboard '{name}'")
+    payload: dict[str, Any] = {"name": name}
+    if description:
+        payload["description"] = description
+    if collection_id is not None:
+        payload["collection_id"] = collection_id
+    if parameters:
+        payload["parameters"] = parameters
+
+    result = await _get_client().request("POST", "/dashboard", json=payload)
+    await ctx.info(f"Created dashboard ID {result.get('id')}")
+    return result
+
+
+@mcp.tool
+async def update_dashboard(
+    dashboard_id: int,
+    ctx: Context,
+    name: str | None = None,
+    description: str | None = None,
+    collection_id: int | None = None,
+    parameters: list[dict[str, Any]] | None = None,
+    archived: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Update an existing dashboard's metadata.
+
+    Args:
+        dashboard_id: The numeric ID of the dashboard.
+        name: New display name.
+        description: New description.
+        collection_id: Move dashboard to this collection.
+        parameters: Replace dashboard filter parameter definitions.
+        archived: True to archive (move to Trash), False to restore.
+    """
+    await ctx.info(f"Updating dashboard {dashboard_id}")
+    payload: dict[str, Any] = {}
+    if name is not None:
+        payload["name"] = name
+    if description is not None:
+        payload["description"] = description
+    if collection_id is not None:
+        payload["collection_id"] = collection_id
+    if parameters is not None:
+        payload["parameters"] = parameters
+    if archived is not None:
+        payload["archived"] = archived
+
+    result = await _get_client().request("PUT", f"/dashboard/{dashboard_id}", json=payload)
+    await ctx.info(f"Updated dashboard {dashboard_id}")
+    return result
+
+
+@mcp.tool
+async def add_card_to_dashboard(
+    dashboard_id: int,
+    card_id: int,
+    ctx: Context,
+    row: int = 0,
+    col: int = 0,
+    size_x: int = 12,
+    size_y: int = 8,
+    parameter_mappings: list[dict[str, Any]] | None = None,
+    visualization_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Add a saved question/card to a dashboard at a specified grid position.
+
+    The dashboard grid is 24 columns wide. Cards are placed using row/col
+    coordinates and sized with size_x (width) / size_y (height) in grid units.
+
+    Args:
+        dashboard_id: The numeric ID of the target dashboard.
+        card_id: The numeric ID of the saved question to add.
+        row: Grid row position (0-based).
+        col: Grid column position (0-based, grid is 24 cols wide).
+        size_x: Card width in grid units (default 12 = half width).
+        size_y: Card height in grid units (default 8).
+        parameter_mappings: Optional dashboard filter → card parameter mappings.
+        visualization_settings: Optional visualization overrides for this placement.
+    """
+    await ctx.info(f"Adding card {card_id} to dashboard {dashboard_id}")
+    payload: dict[str, Any] = {
+        "cardId": card_id,
+        "row": row,
+        "col": col,
+        "size_x": size_x,
+        "size_y": size_y,
+        "parameter_mappings": parameter_mappings or [],
+        "visualization_settings": visualization_settings or {},
+    }
+
+    result = await _get_client().request(
+        "POST", f"/dashboard/{dashboard_id}/cards", json=payload
+    )
+    await ctx.info(f"Added card {card_id} as dashcard ID {result.get('id')}")
+    return result
+
+
+@mcp.tool
+async def update_dashboard_card(
+    dashboard_id: int,
+    dashcard_id: int,
+    ctx: Context,
+    row: int | None = None,
+    col: int | None = None,
+    size_x: int | None = None,
+    size_y: int | None = None,
+    parameter_mappings: list[dict[str, Any]] | None = None,
+    visualization_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Move, resize, or reconfigure a card already placed on a dashboard.
+
+    The dashcard_id is the placement ID (returned by add_card_to_dashboard
+    or visible in get_dashboard response as dashcards[].id), not the card ID.
+
+    Args:
+        dashboard_id: The numeric ID of the dashboard.
+        dashcard_id: The numeric ID of the dashcard placement to update.
+        row: New grid row position.
+        col: New grid column position.
+        size_x: New width in grid units.
+        size_y: New height in grid units.
+        parameter_mappings: Updated filter parameter mappings.
+        visualization_settings: Updated visualization settings.
+    """
+    await ctx.info(f"Updating dashcard {dashcard_id} on dashboard {dashboard_id}")
+
+    # Fetch current state so callers only need to pass changed fields
+    dashboard = await _get_client().request("GET", f"/dashboard/{dashboard_id}")
+    current = next(
+        (dc for dc in dashboard.get("dashcards", []) if dc["id"] == dashcard_id),
+        None,
+    )
+    if current is None:
+        raise ToolError(f"Dashcard {dashcard_id} not found on dashboard {dashboard_id}")
+
+    payload: dict[str, Any] = {
+        "id": dashcard_id,
+        "row": row if row is not None else current["row"],
+        "col": col if col is not None else current["col"],
+        "size_x": size_x if size_x is not None else current["size_x"],
+        "size_y": size_y if size_y is not None else current["size_y"],
+        "parameter_mappings": (
+            parameter_mappings
+            if parameter_mappings is not None
+            else current.get("parameter_mappings", [])
+        ),
+        "visualization_settings": (
+            visualization_settings
+            if visualization_settings is not None
+            else current.get("visualization_settings", {})
+        ),
+    }
+
+    result = await _get_client().request(
+        "PUT", f"/dashboard/{dashboard_id}/dashcard/{dashcard_id}", json=payload
+    )
+    await ctx.info(f"Updated dashcard {dashcard_id}")
+    return result
+
+
+@mcp.tool
+async def remove_card_from_dashboard(
+    dashboard_id: int,
+    dashcard_id: int,
+    ctx: Context,
+) -> dict[str, Any]:
+    """
+    Remove a card placement from a dashboard.
+
+    Args:
+        dashboard_id: The numeric ID of the dashboard.
+        dashcard_id: The numeric ID of the dashcard placement to remove
+                     (from add_card_to_dashboard or get_dashboard response).
+    """
+    await ctx.info(f"Removing dashcard {dashcard_id} from dashboard {dashboard_id}")
+    result = await _get_client().request(
+        "DELETE", f"/dashboard/{dashboard_id}/dashcard/{dashcard_id}"
+    )
+    await ctx.info(f"Removed dashcard {dashcard_id} from dashboard {dashboard_id}")
+    return result or {}
+
+
 # ---------------------------------------------------------------------------
 # ASGI app factory
 # ---------------------------------------------------------------------------
