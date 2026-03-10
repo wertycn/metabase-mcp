@@ -29,26 +29,14 @@ $:
     - services:
         - docker
       stages:
-        - name: Build Docker image
+        - name: Build and export Docker image
           script: |
             IMAGE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
-            VERSION="${CNB_BRANCH}"
-            docker build \
-              -t "${IMAGE}:${VERSION}" \
-              -t "${IMAGE}:latest" \
-              .
-            echo "IMAGE=${IMAGE}" >> /cnb/env
-            echo "VERSION=${VERSION}" >> /cnb/env
+            docker build -t "${IMAGE}:${CNB_BRANCH}" -t "${IMAGE}:latest" .
+            docker save "${IMAGE}:${CNB_BRANCH}" | gzip > "metabase-mcp-${CNB_BRANCH}.tar.gz"
+            ls -lh "metabase-mcp-${CNB_BRANCH}.tar.gz"
 
-        - name: Export image as release artifact
-          script: |
-            source /cnb/env
-            ARTIFACT="metabase-mcp-${VERSION}.tar.gz"
-            docker save "${IMAGE}:${VERSION}" | gzip > "${ARTIFACT}"
-            echo "ARTIFACT=${ARTIFACT}" >> /cnb/env
-            ls -lh "${ARTIFACT}"
-
-        - name: Extract release notes
+        - name: Generate release notes
           script: |
             git fetch --tags --unshallow 2>/dev/null || git fetch --tags
             PREV_TAG=$(git describe --tags --abbrev=0 "${CNB_BRANCH}^" 2>/dev/null || true)
@@ -58,11 +46,7 @@ $:
               RANGE="${CNB_BRANCH}"
             fi
             NOTES=$(git log --pretty=format:'- %s' "$RANGE" | perl -ne 'print unless $seen{$_}++')
-            if [ -z "$NOTES" ]; then
-              NOTES="Release ${CNB_BRANCH}"
-            fi
-            echo "$NOTES" > release_notes.md
-            cat release_notes.md
+            echo "${NOTES:-Release ${CNB_BRANCH}}" > release_notes.md
 
         - name: Create Release
           type: git:release
@@ -79,7 +63,6 @@ $:
 
         - name: Push Docker image
           script: |
-            source /cnb/env
-            docker push "${IMAGE}:${VERSION}"
+            IMAGE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+            docker push "${IMAGE}:${CNB_BRANCH}"
             docker push "${IMAGE}:latest"
-            echo "Pushed ${IMAGE}:${VERSION} and ${IMAGE}:latest"
