@@ -273,6 +273,102 @@ func registerCardTools(s *server.MCPServer, cfg *Config) {
 		},
 	)
 
+	// update_card
+	s.AddTool(
+		mcp.NewTool("update_card",
+			mcp.WithDescription("Update an existing saved question/card in Metabase."),
+			mcp.WithNumber("card_id",
+				mcp.Required(),
+				mcp.Description("The numeric ID of the card to update."),
+			),
+			mcp.WithString("name",
+				mcp.Description("New display name."),
+			),
+			mcp.WithString("description",
+				mcp.Description("New description."),
+			),
+			mcp.WithString("query",
+				mcp.Description("New SQL query."),
+			),
+			mcp.WithString("display",
+				mcp.Description(`Visualization type. Common values: "table", "bar", "line", `+
+					`"area", "pie", "row", "scalar", "smartscalar", "gauge", "progress", `+
+					`"funnel", "scatter", "waterfall", "map".`),
+			),
+			mcp.WithObject("visualization_settings",
+				mcp.Description(`Visualization configuration. Key fields by chart type:`+
+					` bar/line/area/row — {"graph.dimensions":["col1"],"graph.metrics":["col2"]};`+
+					` pie — {"pie.dimension":"col1","pie.metric":"col2"};`+
+					` scalar/smartscalar — {"scalar.field":"col1"}.`),
+			),
+			mcp.WithNumber("collection_id",
+				mcp.Description("Move card to this collection."),
+			),
+			mcp.WithBoolean("archived",
+				mcp.Description("True to archive, false to restore."),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			cardID := req.GetInt("card_id", 0)
+			if cardID == 0 {
+				return errResult("card_id is required"), nil
+			}
+
+			payload := map[string]any{}
+			args := req.GetArguments()
+			if v, ok := args["name"].(string); ok && v != "" {
+				payload["name"] = v
+			}
+			if v, ok := args["description"].(string); ok {
+				payload["description"] = v
+			}
+			if v, ok := args["query"].(string); ok && v != "" {
+				// Wrap the new SQL in a full dataset_query — we need the existing
+				// database_id, so fetch the card first.
+				existing, err := mbRequest(ctx, cfg, "GET", fmt.Sprintf("/card/%d", cardID), nil, nil)
+				if err != nil {
+					return errResult("fetch card: %v", err), nil
+				}
+				dbID := 0
+				if em, ok := existing.(map[string]any); ok {
+					if dq, ok := em["dataset_query"].(map[string]any); ok {
+						dbID = int(toFloat64(dq["database"]))
+					}
+				}
+				if dbID == 0 {
+					return errResult("could not determine database_id from existing card"), nil
+				}
+				payload["dataset_query"] = map[string]any{
+					"database": dbID,
+					"type":     "native",
+					"native":   map[string]any{"query": v},
+				}
+			}
+			if v, ok := args["display"].(string); ok && v != "" {
+				payload["display"] = v
+			}
+			if v, ok := args["visualization_settings"]; ok && v != nil {
+				payload["visualization_settings"] = v
+			}
+			if v, ok := args["collection_id"]; ok && v != nil {
+				payload["collection_id"] = v
+			}
+			if v, ok := args["archived"]; ok && v != nil {
+				payload["archived"] = v
+			}
+
+			if len(payload) == 0 {
+				return errResult("no fields to update"), nil
+			}
+
+			result, err := mbRequest(ctx, cfg, "PUT", fmt.Sprintf("/card/%d", cardID), payload, nil)
+			if err != nil {
+				return errResult("%v", err), nil
+			}
+			return jsonResult(result)
+		},
+	)
+
 	// execute_card
 	s.AddTool(
 		mcp.NewTool("execute_card",
@@ -734,15 +830,19 @@ func registerDashboardTools(s *server.MCPServer, cfg *Config) {
 
 			var current map[string]any
 			if dm, ok := dash.(map[string]any); ok {
-				if dashcards, ok := dm["dashcards"].([]any); ok {
-					for _, dc := range dashcards {
-						if dcm, ok := dc.(map[string]any); ok {
-							if idVal, ok := dcm["id"]; ok {
-								if int(toFloat64(idVal)) == dashcardID {
-									current = dcm
-									break
-								}
-							}
+				// Metabase ≥0.46 uses "dashcards"; older versions use "ordered_cards".
+				var rawCards []any
+				for _, field := range []string{"dashcards", "ordered_cards"} {
+					if v, ok := dm[field].([]any); ok {
+						rawCards = v
+						break
+					}
+				}
+				for _, dc := range rawCards {
+					if dcm, ok := dc.(map[string]any); ok {
+						if int(toFloat64(dcm["id"])) == dashcardID {
+							current = dcm
+							break
 						}
 					}
 				}
@@ -810,8 +910,15 @@ func registerDashboardTools(s *server.MCPServer, cfg *Config) {
 				return errResult("dashcard_id is required"), nil
 			}
 
+			// Metabase ≥0.46: DELETE /dashboard/:id/dashcard/:dashcard-id
 			result, err := mbRequest(ctx, cfg, "DELETE",
 				fmt.Sprintf("/dashboard/%d/dashcard/%d", dashID, dashcardID), nil, nil)
+			if err != nil && strings.Contains(err.Error(), "404") {
+				// Older Metabase: DELETE /dashboard/:id/cards?dashcardId=:id
+				result, err = mbRequest(ctx, cfg, "DELETE",
+					fmt.Sprintf("/dashboard/%d/cards", dashID), nil,
+					map[string]string{"dashcardId": fmt.Sprintf("%d", dashcardID)})
+			}
 			if err != nil {
 				return errResult("%v", err), nil
 			}
