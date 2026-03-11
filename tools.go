@@ -321,14 +321,24 @@ func registerCardTools(s *server.MCPServer, cfg *Config) {
 				mcp.Required(),
 				mcp.Description("SQL query for the card."),
 			),
+			mcp.WithString("display",
+				mcp.Description(`Visualization type. Common values: "table" (default), "bar", "line", `+
+					`"area", "pie", "row", "scalar", "smartscalar", "gauge", "progress", `+
+					`"funnel", "scatter", "waterfall", "map".`),
+				mcp.DefaultString("table"),
+			),
+			mcp.WithObject("visualization_settings",
+				mcp.Description(`Visualization configuration. Key fields by chart type:`+
+					` bar/line/area/row — {"graph.dimensions":["col1"],"graph.metrics":["col2"]};`+
+					` pie — {"pie.dimension":"col1","pie.metric":"col2"};`+
+					` scalar/smartscalar — {"scalar.field":"col1"}.`+
+					` Leave empty for table display.`),
+			),
 			mcp.WithString("description",
 				mcp.Description("Optional description."),
 			),
 			mcp.WithNumber("collection_id",
 				mcp.Description("Optional collection ID to place the card in."),
-			),
-			mcp.WithObject("visualization_settings",
-				mcp.Description("Optional visualization configuration object."),
 			),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -345,6 +355,8 @@ func registerCardTools(s *server.MCPServer, cfg *Config) {
 				return errResult("query is required"), nil
 			}
 
+			display := req.GetString("display", "table")
+
 			payload := map[string]any{
 				"name":        name,
 				"database_id": dbID,
@@ -353,8 +365,8 @@ func registerCardTools(s *server.MCPServer, cfg *Config) {
 					"type":     "native",
 					"native":   map[string]any{"query": query},
 				},
-				"display":                  "table",
-				"visualization_settings":   map[string]any{},
+				"display":                 display,
+				"visualization_settings":  map[string]any{},
 			}
 
 			args := req.GetArguments()
