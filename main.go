@@ -10,6 +10,9 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
+// version is set at build time via -ldflags="-X main.version=x.y.z".
+var version = "dev"
+
 func main() {
 	transport := flag.String(
 		"transport",

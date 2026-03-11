@@ -21,7 +21,7 @@ install-deps:
 
 ## build: compile for the current platform
 build:
-	CGO_ENABLED=0 go build -ldflags="-s -w" -o $(APP) .
+	CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=$(VERSION)" -o $(APP) .
 	@echo "✓ built ./$(APP)"
 
 ## test: run all tests
@@ -39,7 +39,7 @@ release: clean-dist
 		$(eval OUT    := $(DIST)/$(APP)-$(VERSION)-$(GOOS)-$(GOARCH)$(EXT)) \
 		echo "→ building $(OUT)"; \
 		CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
-			go build -ldflags="-s -w" -o $(OUT) . ; \
+			go build -ldflags="-s -w -X main.version=$(VERSION)" -o $(OUT) . ; \
 	)
 	@echo "── release artifacts ──"
 	@ls -lh $(DIST)/
