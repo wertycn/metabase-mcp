@@ -91,6 +91,7 @@ main:
             make build test
 
         - name: Build Docker image
+          image: docker.cnb.cool/debug.icu/dev-image/golang-1.26.0:latest
           script: |
             CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
               go build -ldflags="-s -w" -o metabase-mcp .
