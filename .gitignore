@@ -1,6 +1,10 @@
 # Go build artifacts
 metabase-mcp
+metabase
 dist/
+
+# CNB pipeline artifacts
+cnb.uri
 
 # Environment / secrets
 .env
