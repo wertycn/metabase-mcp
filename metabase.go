@@ -10,6 +10,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -34,6 +37,134 @@ func (c *Credentials) key() string {
 }
 
 // ---------------------------------------------------------------------------
+// Session disk cache
+// ---------------------------------------------------------------------------
+
+const sessionCacheTTL = 24 * time.Hour
+
+// userAgent is selected at startup based on the current OS so that Metabase
+// sees a plausible browser string regardless of platform.
+var userAgent = func() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	case "darwin":
+		return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	default:
+		return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	}
+}()
+
+type sessionEntry struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// diskStore is the JSON structure written to disk.
+// sessions has a 24-hour TTL; devices is permanent and never cleared.
+type diskStore struct {
+	Sessions map[string]*sessionEntry `json:"sessions"`
+	Devices  map[string]string        `json:"devices"` // credKey → metabase.DEVICE cookie value
+}
+
+// sessionDiskCache persists Metabase session tokens and device IDs to the
+// user's local cache directory so that stdio-mode restarts can reuse them.
+// Device IDs are stored permanently; session tokens expire after sessionCacheTTL.
+type sessionDiskCache struct {
+	mu       sync.Mutex
+	path     string
+	sessions map[string]*sessionEntry
+	devices  map[string]string
+}
+
+var globalSessionCache *sessionDiskCache
+
+func initSessionCache() {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		cacheDir = os.TempDir()
+	}
+	dir := filepath.Join(cacheDir, "metabase-mcp")
+	_ = os.MkdirAll(dir, 0o700)
+	path := filepath.Join(dir, "sessions.json")
+
+	sc := &sessionDiskCache{
+		path:     path,
+		sessions: make(map[string]*sessionEntry),
+		devices:  make(map[string]string),
+	}
+	sc.load()
+	globalSessionCache = sc
+}
+
+func (sc *sessionDiskCache) load() {
+	data, err := os.ReadFile(sc.path)
+	if err != nil {
+		return
+	}
+	var store diskStore
+	if json.Unmarshal(data, &store) != nil {
+		return
+	}
+	if store.Sessions != nil {
+		sc.sessions = store.Sessions
+	}
+	if store.Devices != nil {
+		sc.devices = store.Devices
+	}
+}
+
+func (sc *sessionDiskCache) save() {
+	store := diskStore{Sessions: sc.sessions, Devices: sc.devices}
+	data, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(sc.path, data, 0o600)
+}
+
+// getSession returns a valid (non-expired) session token, or "" if absent/expired.
+func (sc *sessionDiskCache) getSession(key string) string {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	e, ok := sc.sessions[key]
+	if !ok || time.Now().After(e.ExpiresAt) {
+		return ""
+	}
+	return e.Token
+}
+
+// getDeviceID returns the permanent device ID for this credential set.
+func (sc *sessionDiskCache) getDeviceID(key string) string {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.devices[key]
+}
+
+// setSession saves a session token with a TTL. If deviceID is non-empty it is
+// also persisted permanently (overwriting any previous value).
+func (sc *sessionDiskCache) setSession(key, token, deviceID string) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.sessions[key] = &sessionEntry{
+		Token:     token,
+		ExpiresAt: time.Now().Add(sessionCacheTTL),
+	}
+	if deviceID != "" {
+		sc.devices[key] = deviceID
+	}
+	sc.save()
+}
+
+// deleteSession removes only the session token; the device ID is kept forever.
+func (sc *sessionDiskCache) deleteSession(key string) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	delete(sc.sessions, key)
+	sc.save()
+}
+
+// ---------------------------------------------------------------------------
 // MetabaseClient
 // ---------------------------------------------------------------------------
 
@@ -43,19 +174,32 @@ type MetabaseClient struct {
 	email        string
 	password     string
 	apiKey       string
+	credKey      string // sha256 of credentials, used as disk cache key
 	sessionToken string
+	deviceID     string // metabase.DEVICE cookie, persisted across restarts
 	http         *http.Client
 	mu           sync.Mutex
 }
 
 func newMetabaseClient(creds *Credentials, proxyURL string) *MetabaseClient {
-	return &MetabaseClient{
+	c := &MetabaseClient{
 		baseURL:  creds.MetabaseURL,
 		email:    creds.Email,
 		password: creds.Password,
 		apiKey:   creds.APIKey,
+		credKey:  creds.key(),
 		http:     buildHTTPClient(proxyURL),
 	}
+	// Restore session and device ID from disk cache (email/password auth only).
+	// Device ID is always restored (permanent); session token only if not expired.
+	if globalSessionCache != nil && creds.APIKey == "" {
+		c.deviceID = globalSessionCache.getDeviceID(c.credKey)
+		if token := globalSessionCache.getSession(c.credKey); token != "" {
+			c.sessionToken = token
+			slog.Info("Restored session from disk cache", "email", creds.Email)
+		}
+	}
+	return c
 }
 
 // buildHTTPClient creates an http.Client that:
@@ -93,6 +237,10 @@ func buildHTTPClient(proxyURL string) *http.Client {
 }
 
 // login obtains a Metabase session token via email + password.
+// It sends the persisted device ID cookie (if any) so Metabase can recognise
+// the client as a known device, and extracts a new device ID from the
+// Set-Cookie response when one is issued.  The session token and device ID are
+// persisted to disk so they survive process restarts (stdio mode).
 func (c *MetabaseClient) login(ctx context.Context) error {
 	body, _ := json.Marshal(map[string]string{
 		"username": c.email,
@@ -104,6 +252,10 @@ func (c *MetabaseClient) login(ctx context.Context) error {
 		return fmt.Errorf("build login request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", userAgent)
+	if c.deviceID != "" {
+		req.AddCookie(&http.Cookie{Name: "metabase.DEVICE", Value: c.deviceID})
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -116,6 +268,14 @@ func (c *MetabaseClient) login(ctx context.Context) error {
 		return fmt.Errorf("metabase authentication failed (%d): %s", resp.StatusCode, b)
 	}
 
+	// Extract device ID from Set-Cookie if the server issued one.
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "metabase.DEVICE" && cookie.Value != "" {
+			c.deviceID = cookie.Value
+			break
+		}
+	}
+
 	var result map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return fmt.Errorf("decode login response: %w", err)
@@ -125,7 +285,12 @@ func (c *MetabaseClient) login(ctx context.Context) error {
 		return fmt.Errorf("metabase login: missing session id in response")
 	}
 	c.sessionToken = token
-	slog.Info("Acquired Metabase session token", "email", c.email)
+	slog.Info("Acquired Metabase session token", "email", c.email, "device_id", c.deviceID)
+
+	// Persist session token (TTL: sessionCacheTTL) and device ID (permanent).
+	if globalSessionCache != nil {
+		globalSessionCache.setSession(c.credKey, token, c.deviceID)
+	}
 	return nil
 }
 
@@ -183,6 +348,8 @@ func (c *MetabaseClient) doRequest(
 		req.URL.RawQuery = q.Encode()
 	}
 
+	req.Header.Set("User-Agent", userAgent)
+
 	headers, err := c.authHeaders(ctx)
 	if err != nil {
 		return nil, err
@@ -201,6 +368,9 @@ func (c *MetabaseClient) doRequest(
 	if resp.StatusCode == http.StatusUnauthorized && retryAuth && c.apiKey == "" {
 		slog.Info("Session expired, re-authenticating", "email", c.email)
 		c.sessionToken = ""
+		if globalSessionCache != nil {
+			globalSessionCache.deleteSession(c.credKey)
+		}
 		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		resp.Body.Close()
 		return c.doRequest(ctx, method, path, body, queryParams, false)

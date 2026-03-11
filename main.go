@@ -19,6 +19,7 @@ func main() {
 	flag.Parse()
 
 	cfg := loadConfig()
+	initSessionCache()
 	initCache(cfg.ClientCacheTTL)
 
 	slog.Info("Starting Metabase MCP server",
