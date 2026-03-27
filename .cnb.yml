@@ -105,8 +105,11 @@ main:
         - name: sync to github
           image: tencentcom/git-sync
           settings:
-            target_url: https://github.com/wertycn/metadaba-mcp.git
+            target_url: https://github.com/wertycn/metabase-mcp.git
             auth_type: https
             username: wertycn
             password: ${GH_TOKEN}
+            branch: main
+            push_tags: "false"
+            force: "true"
 
