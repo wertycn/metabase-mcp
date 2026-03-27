@@ -10,6 +10,7 @@ $:
       imports:
         - https://cnb.cool/debug.icu/secrets/-/blob/main/claude.proxy.yaml
         - https://cnb.cool/debug.icu/secrets/-/blob/main/llm.yaml
+
       services:
         - vscode
         - docker
@@ -29,6 +30,10 @@ $:
         - name: Install dependencies
           script: |
             make install-deps
+
+        - name: github set
+          script: |
+            git remote add github https://github.com/wertycn/metabase-mcp.git
 
 # ── Tag 事件：多平台编译 → 创建 Release → 上传制品 → 构建并推送镜像 ──────────
   tag_push:
@@ -84,6 +89,8 @@ main:
   push:
     - services:
         - docker
+      imports:
+        - https://cnb.cool/debug.icu/secrets/-/blob/main/common.yaml
       stages:
         - name: Test and build
           image: docker.cnb.cool/debug.icu/dev-image/golang-1.26.0:latest
@@ -94,3 +101,12 @@ main:
           script: |
             docker build -t metabase-mcp:test .
             echo "✓ Docker image built successfully (not pushed)"
+
+        - name: sync to github
+          image: tencentcom/git-sync
+          settings:
+            target_url: https://github.com/wertycn/metadaba-mcp.git
+            auth_type: https
+            username: wertycn
+            password: ${GH_TOKEN}
+
