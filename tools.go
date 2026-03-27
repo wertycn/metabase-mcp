@@ -307,6 +307,12 @@ func registerCardTools(s *server.MCPServer, cfg *Config) {
 			mcp.WithBoolean("archived",
 				mcp.Description("True to archive, false to restore."),
 			),
+			mcp.WithObject("template_tags",
+				mcp.Description("Native query template-tags metadata. Replaces the entire template-tags map. " +
+					"Each key is the variable name; each value is an object with fields: name (string), " +
+					`display-name (string), type ("text"|"number"|"date"|"dimension"), default (optional), required (bool). ` +
+					`Example: {"bucket":{"name":"bucket","display-name":"Bucket","type":"text","default":"%","required":false}}`),
+			),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			cardID := req.GetInt("card_id", 0)
@@ -322,28 +328,50 @@ func registerCardTools(s *server.MCPServer, cfg *Config) {
 			if v, ok := args["description"].(string); ok {
 				payload["description"] = v
 			}
-			if v, ok := args["query"].(string); ok && v != "" {
-				// Wrap the new SQL in a full dataset_query — we need the existing
-				// database_id, so fetch the card first.
+
+			// Handle query and/or template_tags — both may require fetching the existing card.
+			newQuery, hasQuery := args["query"].(string)
+			hasQuery = hasQuery && newQuery != ""
+			newTemplateTags, hasTemplateTags := args["template_tags"]
+			hasTemplateTags = hasTemplateTags && newTemplateTags != nil
+
+			if hasQuery || hasTemplateTags {
 				existing, err := mbRequest(ctx, cfg, "GET", fmt.Sprintf("/card/%d", cardID), nil, nil)
 				if err != nil {
 					return errResult("fetch card: %v", err), nil
 				}
-				dbID := 0
-				if em, ok := existing.(map[string]any); ok {
-					if dq, ok := em["dataset_query"].(map[string]any); ok {
-						dbID = int(toFloat64(dq["database"]))
-					}
-				}
+				em, _ := existing.(map[string]any)
+				dq, _ := em["dataset_query"].(map[string]any)
+				dbID := int(toFloat64(dq["database"]))
 				if dbID == 0 {
 					return errResult("could not determine database_id from existing card"), nil
 				}
+
+				existingNative, _ := dq["native"].(map[string]any)
+
+				// Use provided query or fall back to existing one.
+				sqlQuery := newQuery
+				if !hasQuery {
+					sqlQuery, _ = existingNative["query"].(string)
+				}
+
+				native := map[string]any{"query": sqlQuery}
+
+				// Preserve existing template-tags unless explicitly overridden.
+				if existingTags, ok := existingNative["template-tags"]; ok && existingTags != nil {
+					native["template-tags"] = existingTags
+				}
+				if hasTemplateTags {
+					native["template-tags"] = newTemplateTags
+				}
+
 				payload["dataset_query"] = map[string]any{
 					"database": dbID,
 					"type":     "native",
-					"native":   map[string]any{"query": v},
+					"native":   native,
 				}
 			}
+
 			if v, ok := args["display"].(string); ok && v != "" {
 				payload["display"] = v
 			}
@@ -436,6 +464,13 @@ func registerCardTools(s *server.MCPServer, cfg *Config) {
 			mcp.WithNumber("collection_id",
 				mcp.Description("Optional collection ID to place the card in."),
 			),
+			mcp.WithObject("template_tags",
+				mcp.Description(`Native query template-tags metadata, required when the SQL contains `+
+					`{{variable}} or [[ optional clause ]] syntax. Each key is the variable name; `+
+					`each value is an object with fields: name (string), display-name (string), `+
+					`type ("text"|"number"|"date"|"dimension"), default (optional), required (bool). `+
+					`Example: {"bucket":{"name":"bucket","display-name":"Bucket","type":"text","default":"%","required":false}}`),
+			),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			name := req.GetString("name", "")
@@ -453,19 +488,24 @@ func registerCardTools(s *server.MCPServer, cfg *Config) {
 
 			display := req.GetString("display", "table")
 
+			native := map[string]any{"query": query}
+			args := req.GetArguments()
+			if tt, ok := args["template_tags"]; ok && tt != nil {
+				native["template-tags"] = tt
+			}
+
 			payload := map[string]any{
 				"name":        name,
 				"database_id": dbID,
 				"dataset_query": map[string]any{
 					"database": dbID,
 					"type":     "native",
-					"native":   map[string]any{"query": query},
+					"native":   native,
 				},
-				"display":                 display,
-				"visualization_settings":  map[string]any{},
+				"display":                display,
+				"visualization_settings": map[string]any{},
 			}
 
-			args := req.GetArguments()
 			if desc, ok := args["description"].(string); ok && desc != "" {
 				payload["description"] = desc
 			}
@@ -549,6 +589,10 @@ func registerCollectionTools(s *server.MCPServer, cfg *Config) {
 			mcp.WithNumber("parent_id",
 				mcp.Description("Optional numeric ID of the parent collection."),
 			),
+			mcp.WithString("color",
+				mcp.Description(`Collection color in #RRGGBB format (default "#509EE3").`),
+				mcp.DefaultString("#509EE3"),
+			),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			name := req.GetString("name", "")
@@ -556,7 +600,8 @@ func registerCollectionTools(s *server.MCPServer, cfg *Config) {
 				return errResult("name is required"), nil
 			}
 
-			payload := map[string]any{"name": name}
+			color := req.GetString("color", "#509EE3")
+			payload := map[string]any{"name": name, "color": color}
 			args := req.GetArguments()
 			if desc, ok := args["description"].(string); ok && desc != "" {
 				payload["description"] = desc
@@ -878,8 +923,13 @@ func registerDashboardTools(s *server.MCPServer, cfg *Config) {
 				}(),
 			}
 
+			// PUT /api/dashboard/:id/cards is the batch-update endpoint supported in Metabase v0.46.
+			// (The single-dashcard endpoint PUT /dashboard/:id/dashcard/:id was added later and is not
+			// present in v0.46.)
 			result, err := client.Request(ctx, "PUT",
-				fmt.Sprintf("/dashboard/%d/dashcard/%d", dashID, dashcardID), payload, nil)
+				fmt.Sprintf("/dashboard/%d/cards", dashID),
+				map[string]any{"cards": []any{payload}},
+				nil)
 			if err != nil {
 				return errResult("%v", err), nil
 			}
