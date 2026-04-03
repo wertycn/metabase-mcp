@@ -27,6 +27,14 @@ type Config struct {
 
 	// MetabaseClient cache TTL in seconds
 	ClientCacheTTL int
+
+	// Transport mode: "stdio" or "http"
+	Transport string
+
+	// Named Metabase instances for multi-instance scenarios (e.g. migration).
+	// Key is the instance identifier (e.g. "hz", "sg").
+	// The default instance (from METABASE_URL) is stored under key "default".
+	Instances map[string]*Credentials
 }
 
 func loadConfig() *Config {
@@ -65,6 +73,60 @@ func loadConfig() *Config {
 			cfg.DefaultEmail = user
 			cfg.DefaultPassword = pass
 			cfg.DefaultAPIKey = ""
+		}
+	}
+
+	// Named instances: register default + any from METABASE_INSTANCES.
+	cfg.Instances = make(map[string]*Credentials)
+	if cfg.MetabaseURL != "" {
+		cfg.Instances["default"] = &Credentials{
+			MetabaseURL: cfg.MetabaseURL,
+			Email:       cfg.DefaultEmail,
+			Password:    cfg.DefaultPassword,
+			APIKey:      cfg.DefaultAPIKey,
+		}
+	}
+
+	// METABASE_INSTANCES is a comma-separated list of instance names.
+	// Each instance reads from METABASE_{NAME}_URL, METABASE_{NAME}_EMAIL,
+	// METABASE_{NAME}_PASSWORD, METABASE_{NAME}_API_KEY, or
+	// METABASE_{NAME}_CREDENTIALS (base64url-encoded, same as METABASE_CREDENTIALS).
+	if names := getEnv("METABASE_INSTANCES", ""); names != "" {
+		for _, name := range strings.Split(names, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			prefix := "METABASE_" + strings.ToUpper(name) + "_"
+			creds := &Credentials{
+				MetabaseURL: strings.TrimRight(getEnv(prefix+"URL", ""), "/"),
+				Email:       getEnv(prefix+"EMAIL", ""),
+				Password:    getEnv(prefix+"PASSWORD", ""),
+				APIKey:      getEnv(prefix+"API_KEY", ""),
+			}
+			if raw := getEnv(prefix+"CREDENTIALS", ""); raw != "" {
+				user, pass, ok := decodePathCreds(raw)
+				if !ok {
+					slog.Warn("Could not decode instance credentials", "instance", name)
+				} else if strings.EqualFold(user, "apikey") {
+					creds.APIKey = pass
+					creds.Email = ""
+					creds.Password = ""
+				} else {
+					creds.Email = user
+					creds.Password = pass
+					creds.APIKey = ""
+				}
+			}
+			if creds.MetabaseURL == "" {
+				slog.Warn("Instance has no URL, skipping", "instance", name)
+				continue
+			}
+			cfg.Instances[name] = creds
+			// Also register as default if no default URL was set and this is the first
+			if cfg.MetabaseURL == "" && len(cfg.Instances) == 1 {
+				cfg.Instances["default"] = creds
+			}
 		}
 	}
 

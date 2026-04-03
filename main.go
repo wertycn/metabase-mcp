@@ -22,6 +22,7 @@ func main() {
 	flag.Parse()
 
 	cfg := loadConfig()
+	cfg.Transport = *transport
 	initSessionCache()
 	initCache(cfg.ClientCacheTTL)
 

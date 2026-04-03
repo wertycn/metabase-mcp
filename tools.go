@@ -27,6 +27,7 @@ func buildServer(cfg *Config) *server.MCPServer {
 	registerCardTools(s, cfg)
 	registerCollectionTools(s, cfg)
 	registerDashboardTools(s, cfg)
+	registerMigrationTools(s, cfg)
 
 	return s
 }
@@ -832,6 +833,76 @@ func registerDashboardTools(s *server.MCPServer, cfg *Config) {
 		},
 	)
 
+	// add_text_card_to_dashboard
+	s.AddTool(
+		mcp.NewTool("add_text_card_to_dashboard",
+			mcp.WithDescription(
+				"Add a markdown/text card to a dashboard. This card has no underlying saved question — "+
+					"it is a virtual card used for headings, descriptions, or any rich-text content (Markdown supported). "+
+					"The dashboard grid is 24 columns wide."),
+			mcp.WithNumber("dashboard_id",
+				mcp.Required(),
+				mcp.Description("The numeric ID of the target dashboard."),
+			),
+			mcp.WithString("text",
+				mcp.Required(),
+				mcp.Description("Markdown text content for the card (e.g. \"## Section Title\")."),
+			),
+			mcp.WithNumber("row",
+				mcp.Description("Grid row position (0-based, default 0)."),
+				mcp.DefaultNumber(0),
+			),
+			mcp.WithNumber("col",
+				mcp.Description("Grid column position (0-based, default 0)."),
+				mcp.DefaultNumber(0),
+			),
+			mcp.WithNumber("size_x",
+				mcp.Description("Card width in grid units (default 18)."),
+				mcp.DefaultNumber(18),
+			),
+			mcp.WithNumber("size_y",
+				mcp.Description("Card height in grid units (default 1)."),
+				mcp.DefaultNumber(1),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			dashID := req.GetInt("dashboard_id", 0)
+			if dashID == 0 {
+				return errResult("dashboard_id is required"), nil
+			}
+			text := req.GetString("text", "")
+			if text == "" {
+				return errResult("text is required"), nil
+			}
+
+			payload := map[string]any{
+				"cardId": nil,
+				"row":    req.GetInt("row", 0),
+				"col":    req.GetInt("col", 0),
+				"size_x": req.GetInt("size_x", 18),
+				"size_y": req.GetInt("size_y", 1),
+				"series": []any{},
+				"parameter_mappings": []any{},
+				"visualization_settings": map[string]any{
+					"virtual_card": map[string]any{
+						"name":                   nil,
+						"display":                "text",
+						"visualization_settings": map[string]any{},
+						"dataset_query":          map[string]any{},
+						"archived":               false,
+					},
+					"text": text,
+				},
+			}
+
+			result, err := mbRequest(ctx, cfg, "POST", fmt.Sprintf("/dashboard/%d/cards", dashID), payload, nil)
+			if err != nil {
+				return errResult("%v", err), nil
+			}
+			return jsonResult(result)
+		},
+	)
+
 	// update_dashboard_card
 	s.AddTool(
 		mcp.NewTool("update_dashboard_card",
@@ -976,6 +1047,436 @@ func registerDashboardTools(s *server.MCPServer, cfg *Config) {
 				return mcp.NewToolResultText("{}"), nil
 			}
 			return jsonResult(result)
+		},
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Migration tools
+// ---------------------------------------------------------------------------
+
+func registerMigrationTools(s *server.MCPServer, cfg *Config) {
+	// list_instances
+	s.AddTool(
+		mcp.NewTool("list_instances",
+			mcp.WithDescription("List all configured Metabase instances. Shows name, URL, and which one is the current default. Credentials are not displayed."),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			type instanceInfo struct {
+				Name      string `json:"name"`
+				URL       string `json:"url"`
+				IsDefault bool   `json:"is_default"`
+			}
+			var list []instanceInfo
+			for name, creds := range cfg.Instances {
+				if name == "default" {
+					continue
+				}
+				list = append(list, instanceInfo{
+					Name:      name,
+					URL:       creds.MetabaseURL,
+					IsDefault: cfg.Instances["default"] == creds,
+				})
+			}
+			// If only "default" exists (no named instances), show it
+			if len(list) == 0 {
+				if creds, ok := cfg.Instances["default"]; ok {
+					list = append(list, instanceInfo{
+						Name:      "default",
+						URL:       creds.MetabaseURL,
+						IsDefault: true,
+					})
+				}
+			}
+			// Sort by name for stable output
+			sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+			return jsonResult(list)
+		},
+	)
+
+	// switch_default_instance (stdio only)
+	s.AddTool(
+		mcp.NewTool("switch_default_instance",
+			mcp.WithDescription("Switch the default Metabase instance used by all tools (stdio mode only). "+
+				"In HTTP mode, use the X-Metabase-Instance header per request instead. "+
+				"The named instance must be configured via METABASE_INSTANCES env var."),
+			mcp.WithString("instance",
+				mcp.Required(),
+				mcp.Description("Name of the instance to set as default (e.g. \"hz\", \"sg\")."),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if cfg.Transport == "http" {
+				return errResult("switch_default_instance is not available in HTTP mode — use the X-Metabase-Instance header per request instead"), nil
+			}
+
+			name := req.GetString("instance", "")
+			if name == "" {
+				return errResult("instance is required"), nil
+			}
+			creds, ok := cfg.Instances[name]
+			if !ok {
+				available := make([]string, 0, len(cfg.Instances))
+				for k := range cfg.Instances {
+					if k != "default" {
+						available = append(available, k)
+					}
+				}
+				sort.Strings(available)
+				return errResult("unknown instance %q (available: %v)", name, available), nil
+			}
+
+			cfg.Instances["default"] = creds
+			cfg.MetabaseURL = creds.MetabaseURL
+			cfg.DefaultEmail = creds.Email
+			cfg.DefaultPassword = creds.Password
+			cfg.DefaultAPIKey = creds.APIKey
+
+			return mcp.NewToolResultText(fmt.Sprintf("Default instance switched to %q (%s)", name, creds.MetabaseURL)), nil
+		},
+	)
+
+	// migrate_collection
+	s.AddTool(
+		mcp.NewTool("migrate_collection",
+			mcp.WithDescription(
+				"Migrate cards and dashboards from source collections to target collections across "+
+					"databases or Metabase instances. Replaces database_id and region constants in SQL. "+
+					"Source and target collection_ids must be paired 1:1 by index. "+
+					"All cards are migrated first, then dashboards (with card_id references remapped). "+
+					"Use source_instance / target_instance to specify named Metabase instances "+
+					"(configured via METABASE_INSTANCES env var). Omit or pass empty to use the default instance."),
+			mcp.WithArray("source_collection_ids",
+				mcp.Required(),
+				mcp.Description("Ordered list of source collection IDs (numbers)."),
+			),
+			mcp.WithArray("target_collection_ids",
+				mcp.Required(),
+				mcp.Description("Ordered list of target collection IDs (numbers), paired 1:1 with source."),
+			),
+			mcp.WithNumber("target_database_id",
+				mcp.Required(),
+				mcp.Description("Database ID to use for all migrated cards in the target."),
+			),
+			mcp.WithObject("region_mapping",
+				mcp.Description(`String replacements applied to SQL queries. Each key is replaced by its value. `+
+					`Example: {"hz":"sg","hangzhou":"singapore"}. Replacements are case-sensitive.`),
+			),
+			mcp.WithString("source_instance",
+				mcp.Description(`Named Metabase instance to read from (e.g. "hz"). `+
+					`Configured via METABASE_INSTANCES and METABASE_{NAME}_URL/EMAIL/PASSWORD/API_KEY env vars. `+
+					`Omit or pass empty to use the default instance.`),
+			),
+			mcp.WithString("target_instance",
+				mcp.Description(`Named Metabase instance to write to (e.g. "sg"). `+
+					`Omit or pass empty to use the default instance.`),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			args := req.GetArguments()
+
+			// --- Parse parameters ---
+			srcIDs, _ := args["source_collection_ids"].([]any)
+			tgtIDs, _ := args["target_collection_ids"].([]any)
+			if len(srcIDs) == 0 || len(tgtIDs) == 0 {
+				return errResult("source_collection_ids and target_collection_ids are required"), nil
+			}
+			if len(srcIDs) != len(tgtIDs) {
+				return errResult("source_collection_ids and target_collection_ids must have the same length"), nil
+			}
+
+			targetDBID := req.GetInt("target_database_id", 0)
+			if targetDBID == 0 {
+				return errResult("target_database_id is required"), nil
+			}
+
+			regionMap := map[string]string{}
+			if rm, ok := args["region_mapping"].(map[string]any); ok {
+				for k, v := range rm {
+					if vs, ok := v.(string); ok {
+						regionMap[k] = vs
+					}
+				}
+			}
+
+			// --- Resolve source and target clients ---
+			srcInstance := req.GetString("source_instance", "")
+			tgtInstance := req.GetString("target_instance", "")
+
+			srcClient, err := getInstanceClient(srcInstance, cfg)
+			if err != nil {
+				// Fallback: if no named instance, try context-based default
+				srcClient, err = getClient(ctx, cfg)
+				if err != nil {
+					return errResult("source client: %v", err), nil
+				}
+			}
+
+			var tgtClient *MetabaseClient
+			if tgtInstance != "" && tgtInstance != srcInstance {
+				tgtClient, err = getInstanceClient(tgtInstance, cfg)
+				if err != nil {
+					return errResult("target client: %v", err), nil
+				}
+			} else {
+				tgtClient = srcClient
+			}
+
+			// --- Helper: apply region replacements to SQL ---
+			replaceSQL := func(sql string) string {
+				for old, new := range regionMap {
+					sql = strings.ReplaceAll(sql, old, new)
+				}
+				return sql
+			}
+
+			// --- Phase 1: Migrate cards, build old→new mapping ---
+			cardIDMap := map[int]int{} // old card_id → new card_id
+			var migLog []map[string]any
+
+			for i, srcRaw := range srcIDs {
+				srcColID := int(toFloat64(srcRaw))
+				tgtColID := int(toFloat64(tgtIDs[i]))
+
+				// List cards in source collection
+				items, err := srcClient.Request(ctx, "GET",
+					fmt.Sprintf("/collection/%d/items", srcColID), nil,
+					map[string]string{"model": "card"})
+				if err != nil {
+					return errResult("list cards in collection %d: %v", srcColID, err), nil
+				}
+
+				// The response has a "data" array
+				var cardItems []any
+				switch v := items.(type) {
+				case map[string]any:
+					cardItems, _ = v["data"].([]any)
+				case []any:
+					cardItems = v
+				}
+
+				for _, item := range cardItems {
+					itemMap, ok := item.(map[string]any)
+					if !ok {
+						continue
+					}
+					oldCardID := int(toFloat64(itemMap["id"]))
+					if oldCardID == 0 {
+						continue
+					}
+
+					// Fetch full card details from source
+					cardDetail, err := srcClient.Request(ctx, "GET",
+						fmt.Sprintf("/card/%d", oldCardID), nil, nil)
+					if err != nil {
+						return errResult("get card %d: %v", oldCardID, err), nil
+					}
+					cd, _ := cardDetail.(map[string]any)
+
+					// Extract query info
+					dq, _ := cd["dataset_query"].(map[string]any)
+					native, _ := dq["native"].(map[string]any)
+					sqlQuery, _ := native["query"].(string)
+					sqlQuery = replaceSQL(sqlQuery)
+
+					newNative := map[string]any{"query": sqlQuery}
+					if tags, ok := native["template-tags"]; ok && tags != nil {
+						newNative["template-tags"] = tags
+					}
+
+					// Build create payload
+					createPayload := map[string]any{
+						"name":        cd["name"],
+						"database_id": targetDBID,
+						"dataset_query": map[string]any{
+							"database": targetDBID,
+							"type":     "native",
+							"native":   newNative,
+						},
+						"display":                cd["display"],
+						"visualization_settings": cd["visualization_settings"],
+						"collection_id":          tgtColID,
+					}
+					if desc, ok := cd["description"].(string); ok && desc != "" {
+						createPayload["description"] = desc
+					}
+
+					// Create card in target
+					result, err := tgtClient.Request(ctx, "POST", "/card", createPayload, nil)
+					if err != nil {
+						return errResult("create card (source %d): %v", oldCardID, err), nil
+					}
+					rm, _ := result.(map[string]any)
+					newCardID := int(toFloat64(rm["id"]))
+					cardIDMap[oldCardID] = newCardID
+
+					migLog = append(migLog, map[string]any{
+						"type":        "card",
+						"source_id":   oldCardID,
+						"target_id":   newCardID,
+						"name":        cd["name"],
+						"collection":  tgtColID,
+					})
+				}
+			}
+
+			// --- Phase 2: Migrate dashboards ---
+			for i, srcRaw := range srcIDs {
+				srcColID := int(toFloat64(srcRaw))
+				tgtColID := int(toFloat64(tgtIDs[i]))
+
+				// List dashboards in source collection
+				items, err := srcClient.Request(ctx, "GET",
+					fmt.Sprintf("/collection/%d/items", srcColID), nil,
+					map[string]string{"model": "dashboard"})
+				if err != nil {
+					return errResult("list dashboards in collection %d: %v", srcColID, err), nil
+				}
+
+				var dashItems []any
+				switch v := items.(type) {
+				case map[string]any:
+					dashItems, _ = v["data"].([]any)
+				case []any:
+					dashItems = v
+				}
+
+				for _, item := range dashItems {
+					itemMap, ok := item.(map[string]any)
+					if !ok {
+						continue
+					}
+					oldDashID := int(toFloat64(itemMap["id"]))
+					if oldDashID == 0 {
+						continue
+					}
+
+					// Fetch full dashboard from source
+					dashDetail, err := srcClient.Request(ctx, "GET",
+						fmt.Sprintf("/dashboard/%d", oldDashID), nil, nil)
+					if err != nil {
+						return errResult("get dashboard %d: %v", oldDashID, err), nil
+					}
+					dd, _ := dashDetail.(map[string]any)
+
+					// Create new dashboard in target
+					createDash := map[string]any{
+						"name":          dd["name"],
+						"collection_id": tgtColID,
+					}
+					if desc, ok := dd["description"].(string); ok && desc != "" {
+						createDash["description"] = desc
+					}
+					if params, ok := dd["parameters"]; ok && params != nil {
+						createDash["parameters"] = params
+					}
+
+					newDashResult, err := tgtClient.Request(ctx, "POST", "/dashboard", createDash, nil)
+					if err != nil {
+						return errResult("create dashboard (source %d): %v", oldDashID, err), nil
+					}
+					newDash, _ := newDashResult.(map[string]any)
+					newDashID := int(toFloat64(newDash["id"]))
+
+					// Get dashcards from source dashboard
+					dashcards, _ := dd["dashcards"].([]any)
+					if dashcards == nil {
+						dashcards, _ = dd["ordered_cards"].([]any) // older Metabase
+					}
+
+					// Add each dashcard to new dashboard
+					for _, dc := range dashcards {
+						dcMap, ok := dc.(map[string]any)
+						if !ok {
+							continue
+						}
+
+						oldCardID := int(toFloat64(dcMap["card_id"]))
+
+						// Build dashcard payload
+						dcPayload := map[string]any{
+							"row":    int(toFloat64(dcMap["row"])),
+							"col":    int(toFloat64(dcMap["col"])),
+							"size_x": int(toFloat64(dcMap["size_x"])),
+							"size_y": int(toFloat64(dcMap["size_y"])),
+							"series": func() any {
+								if v, ok := dcMap["series"]; ok && v != nil {
+									return v
+								}
+								return []any{}
+							}(),
+							"parameter_mappings": []any{},
+							"visualization_settings": func() any {
+								if v, ok := dcMap["visualization_settings"]; ok && v != nil {
+									return v
+								}
+								return map[string]any{}
+							}(),
+						}
+
+						if oldCardID == 0 {
+							// Virtual card (text/heading) — no card_id, preserve as-is
+							dcPayload["cardId"] = nil
+						} else if newCardID, ok := cardIDMap[oldCardID]; ok {
+							dcPayload["cardId"] = newCardID
+						} else {
+							// Card not in mapping — skip or keep original
+							// (could be a card from a different collection)
+							dcPayload["cardId"] = oldCardID
+						}
+
+						// Remap card_id references inside parameter_mappings
+						if pm, ok := dcMap["parameter_mappings"].([]any); ok && len(pm) > 0 {
+							newPM := make([]any, len(pm))
+							for j, p := range pm {
+								pMap, ok := p.(map[string]any)
+								if !ok {
+									newPM[j] = p
+									continue
+								}
+								// Clone the mapping
+								newP := map[string]any{}
+								for k, v := range pMap {
+									newP[k] = v
+								}
+								// Remap card_id if present
+								if cid := int(toFloat64(newP["card_id"])); cid != 0 {
+									if mapped, ok := cardIDMap[cid]; ok {
+										newP["card_id"] = mapped
+									}
+								}
+								newPM[j] = newP
+							}
+							dcPayload["parameter_mappings"] = newPM
+						}
+
+						_, err := tgtClient.Request(ctx, "POST",
+							fmt.Sprintf("/dashboard/%d/cards", newDashID), dcPayload, nil)
+						if err != nil {
+							return errResult("add card to dashboard %d (source dashcard from dashboard %d): %v",
+								newDashID, oldDashID, err), nil
+						}
+					}
+
+					migLog = append(migLog, map[string]any{
+						"type":        "dashboard",
+						"source_id":   oldDashID,
+						"target_id":   newDashID,
+						"name":        dd["name"],
+						"collection":  tgtColID,
+						"dashcards":   len(dashcards),
+					})
+				}
+			}
+
+			// --- Return summary ---
+			summary := map[string]any{
+				"status":        "ok",
+				"cards_migrated": len(cardIDMap),
+				"card_id_map":   cardIDMap,
+				"details":       migLog,
+			}
+			return jsonResult(summary)
 		},
 	)
 }

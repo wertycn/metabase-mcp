@@ -445,16 +445,24 @@ func (cc *ClientCache) Get(creds *Credentials, proxyURL string) *MetabaseClient 
 	return client
 }
 
-// getClient resolves credentials for the current request (from context or
-// server defaults) and returns a cached MetabaseClient.
+// getClient resolves credentials for the current request and returns a cached MetabaseClient.
+//
+// Resolution order:
+//  1. Per-request context (HTTP headers / Basic Auth / URL path / X-Metabase-Instance)
+//  2. Named "default" instance from cfg.Instances (respects switch_default_instance in stdio)
+//  3. Legacy env-var defaults (METABASE_URL + credentials)
 func getClient(ctx context.Context, cfg *Config) (*MetabaseClient, error) {
 	creds := getCredsFromContext(ctx)
 	if creds == nil {
-		creds = &Credentials{
-			MetabaseURL: cfg.MetabaseURL,
-			Email:       cfg.DefaultEmail,
-			Password:    cfg.DefaultPassword,
-			APIKey:      cfg.DefaultAPIKey,
+		if inst, ok := cfg.Instances["default"]; ok && inst.MetabaseURL != "" {
+			creds = inst
+		} else {
+			creds = &Credentials{
+				MetabaseURL: cfg.MetabaseURL,
+				Email:       cfg.DefaultEmail,
+				Password:    cfg.DefaultPassword,
+				APIKey:      cfg.DefaultAPIKey,
+			}
 		}
 	}
 
@@ -470,5 +478,28 @@ func getClient(ctx context.Context, cfg *Config) (*MetabaseClient, error) {
 				"or METABASE_API_KEY env vars")
 	}
 
+	return globalCache.Get(creds, cfg.MetabaseHTTPProxy), nil
+}
+
+// getInstanceClient returns a cached MetabaseClient for a named instance.
+// An empty name or "default" resolves to the default instance.
+func getInstanceClient(name string, cfg *Config) (*MetabaseClient, error) {
+	if name == "" {
+		name = "default"
+	}
+	creds, ok := cfg.Instances[name]
+	if !ok {
+		available := make([]string, 0, len(cfg.Instances))
+		for k := range cfg.Instances {
+			available = append(available, k)
+		}
+		return nil, fmt.Errorf("unknown Metabase instance %q (available: %v)", name, available)
+	}
+	if creds.MetabaseURL == "" {
+		return nil, fmt.Errorf("instance %q has no URL configured", name)
+	}
+	if creds.APIKey == "" && creds.Email == "" {
+		return nil, fmt.Errorf("instance %q has no credentials configured", name)
+	}
 	return globalCache.Get(creds, cfg.MetabaseHTTPProxy), nil
 }

@@ -77,6 +77,13 @@ func extractCredentials(r *http.Request, cfg *Config) (*Credentials, string) {
 		}
 	}
 
+	// 4. Named instance header: X-Metabase-Instance
+	if inst := strings.TrimSpace(r.Header.Get("X-Metabase-Instance")); inst != "" {
+		if c, ok := cfg.Instances[inst]; ok && c.MetabaseURL != "" {
+			return c, cleanPath
+		}
+	}
+
 	return nil, cleanPath
 }
 
