@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -1246,6 +1247,59 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config, hasNamedInstances 
 				return sql
 			}
 
+			// --- Build target database field index: "schema.table.column" → field_id ---
+			// Used to remap dimension-type template-tag field IDs across databases.
+			type fieldKey struct{ schema, table, column string }
+			tgtFieldIndex := map[fieldKey]int{}
+
+			tgtFields, err := tgtClient.Request(ctx, "GET",
+				fmt.Sprintf("/database/%d/fields", targetDBID), nil, nil)
+			if err != nil {
+				slog.Warn("Could not fetch target database fields, dimension tags will be downgraded to text", "error", err)
+			} else if fieldList, ok := tgtFields.([]any); ok {
+				for _, f := range fieldList {
+					fm, ok := f.(map[string]any)
+					if !ok {
+						continue
+					}
+					fID := int(toFloat64(fm["id"]))
+					colName, _ := fm["name"].(string)
+					tableName, _ := fm["table_name"].(string)
+					schemaName, _ := fm["schema"].(string)
+					// Also apply region mapping to schema/table so "hz" tables map to "sg"
+					schemaName = replaceSQL(schemaName)
+					tableName = replaceSQL(tableName)
+					if fID != 0 && colName != "" && tableName != "" {
+						tgtFieldIndex[fieldKey{schemaName, tableName, colName}] = fID
+					}
+				}
+			}
+
+			// Cache for source field lookups: source field_id → fieldKey
+			srcFieldCache := map[int]*fieldKey{}
+			lookupSourceField := func(fieldID int) *fieldKey {
+				if cached, ok := srcFieldCache[fieldID]; ok {
+					return cached
+				}
+				resp, err := srcClient.Request(ctx, "GET",
+					fmt.Sprintf("/field/%d", fieldID), nil, nil)
+				if err != nil {
+					srcFieldCache[fieldID] = nil
+					return nil
+				}
+				fm, _ := resp.(map[string]any)
+				colName, _ := fm["name"].(string)
+				tableName, _ := fm["table_name"].(string)
+				schemaName, _ := fm["schema"].(string)
+				if colName == "" || tableName == "" {
+					srcFieldCache[fieldID] = nil
+					return nil
+				}
+				key := &fieldKey{schemaName, tableName, colName}
+				srcFieldCache[fieldID] = key
+				return key
+			}
+
 			// --- Phase 1: Migrate cards, build old→new mapping ---
 			cardIDMap := map[int]int{} // old card_id → new card_id
 			var migLog []map[string]any
@@ -1297,9 +1351,6 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config, hasNamedInstances 
 
 					newNative := map[string]any{"query": sqlQuery}
 					if tags, ok := native["template-tags"]; ok && tags != nil {
-						// Sanitize dimension-type template tags: field IDs are
-						// database-specific and cannot be migrated across databases.
-						// Downgrade them to text type so the card can still be created.
 						if tagsMap, ok := tags.(map[string]any); ok {
 							sanitized := make(map[string]any, len(tagsMap))
 							for tagName, tagVal := range tagsMap {
@@ -1309,17 +1360,51 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config, hasNamedInstances 
 									continue
 								}
 								if tagType, _ := tv["type"].(string); tagType == "dimension" {
-									// Convert to text type: drop dimension & widget-type
-									newTag := map[string]any{
-										"type":         "text",
-										"name":         tv["name"],
-										"display-name": tv["display-name"],
-										"id":           tv["id"],
+									// Try to remap the field ID to target database.
+									dim, _ := tv["dimension"].([]any)
+									remapped := false
+									if len(dim) >= 2 {
+										srcFieldID := int(toFloat64(dim[1]))
+										if srcFieldID != 0 {
+											if fk := lookupSourceField(srcFieldID); fk != nil {
+												// Apply region mapping to match target naming
+												mappedKey := fieldKey{replaceSQL(fk.schema), replaceSQL(fk.table), fk.column}
+												if tgtFieldID, ok := tgtFieldIndex[mappedKey]; ok {
+													// Clone the tag with remapped field ID
+													newTag := map[string]any{}
+													for k, v := range tv {
+														newTag[k] = v
+													}
+													newDim := make([]any, len(dim))
+													copy(newDim, dim)
+													newDim[1] = tgtFieldID
+													newTag["dimension"] = newDim
+													sanitized[tagName] = newTag
+													remapped = true
+													slog.Info("Remapped dimension field",
+														"tag", tagName,
+														"source_field_id", srcFieldID,
+														"target_field_id", tgtFieldID,
+														"field", fmt.Sprintf("%s.%s.%s", mappedKey.schema, mappedKey.table, mappedKey.column))
+												}
+											}
+										}
 									}
-									if def, ok := tv["default"]; ok {
-										newTag["default"] = def
+									if !remapped {
+										// Fallback: downgrade to text type
+										newTag := map[string]any{
+											"type":         "text",
+											"name":         tv["name"],
+											"display-name": tv["display-name"],
+											"id":           tv["id"],
+										}
+										if def, ok := tv["default"]; ok {
+											newTag["default"] = def
+										}
+										sanitized[tagName] = newTag
+										slog.Warn("Could not remap dimension field, downgraded to text",
+											"tag", tagName)
 									}
-									sanitized[tagName] = newTag
 								} else {
 									sanitized[tagName] = tagVal
 								}
