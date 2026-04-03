@@ -27,7 +27,15 @@ func buildServer(cfg *Config) *server.MCPServer {
 	registerCardTools(s, cfg)
 	registerCollectionTools(s, cfg)
 	registerDashboardTools(s, cfg)
-	registerMigrationTools(s, cfg)
+	// Only register multi-instance tools when named instances are configured.
+	hasNamedInstances := false
+	for k := range cfg.Instances {
+		if k != "default" {
+			hasNamedInstances = true
+			break
+		}
+	}
+	registerMigrationTools(s, cfg, hasNamedInstances)
 
 	return s
 }
@@ -1052,10 +1060,10 @@ func registerDashboardTools(s *server.MCPServer, cfg *Config) {
 }
 
 // ---------------------------------------------------------------------------
-// Migration tools
+// Instance tools (only registered when named instances are configured)
 // ---------------------------------------------------------------------------
 
-func registerMigrationTools(s *server.MCPServer, cfg *Config) {
+func registerInstanceTools(s *server.MCPServer, cfg *Config) {
 	// list_instances
 	s.AddTool(
 		mcp.NewTool("list_instances",
@@ -1078,7 +1086,6 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config) {
 					IsDefault: cfg.Instances["default"] == creds,
 				})
 			}
-			// If only "default" exists (no named instances), show it
 			if len(list) == 0 {
 				if creds, ok := cfg.Instances["default"]; ok {
 					list = append(list, instanceInfo{
@@ -1088,7 +1095,6 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config) {
 					})
 				}
 			}
-			// Sort by name for stable output
 			sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 			return jsonResult(list)
 		},
@@ -1135,6 +1141,16 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config) {
 			return mcp.NewToolResultText(fmt.Sprintf("Default instance switched to %q (%s)", name, creds.MetabaseURL)), nil
 		},
 	)
+}
+
+// ---------------------------------------------------------------------------
+// Migration tools
+// ---------------------------------------------------------------------------
+
+func registerMigrationTools(s *server.MCPServer, cfg *Config, hasNamedInstances bool) {
+	if hasNamedInstances {
+		registerInstanceTools(s, cfg)
+	}
 
 	// migrate_collection
 	s.AddTool(
@@ -1344,6 +1360,10 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config) {
 				for _, item := range dashItems {
 					itemMap, ok := item.(map[string]any)
 					if !ok {
+						continue
+					}
+					// The API filter is not always reliable — verify the model field.
+					if model, _ := itemMap["model"].(string); model != "dashboard" {
 						continue
 					}
 					oldDashID := int(toFloat64(itemMap["id"]))
