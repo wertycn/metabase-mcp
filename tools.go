@@ -1297,7 +1297,37 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config, hasNamedInstances 
 
 					newNative := map[string]any{"query": sqlQuery}
 					if tags, ok := native["template-tags"]; ok && tags != nil {
-						newNative["template-tags"] = tags
+						// Sanitize dimension-type template tags: field IDs are
+						// database-specific and cannot be migrated across databases.
+						// Downgrade them to text type so the card can still be created.
+						if tagsMap, ok := tags.(map[string]any); ok {
+							sanitized := make(map[string]any, len(tagsMap))
+							for tagName, tagVal := range tagsMap {
+								tv, ok := tagVal.(map[string]any)
+								if !ok {
+									sanitized[tagName] = tagVal
+									continue
+								}
+								if tagType, _ := tv["type"].(string); tagType == "dimension" {
+									// Convert to text type: drop dimension & widget-type
+									newTag := map[string]any{
+										"type":         "text",
+										"name":         tv["name"],
+										"display-name": tv["display-name"],
+										"id":           tv["id"],
+									}
+									if def, ok := tv["default"]; ok {
+										newTag["default"] = def
+									}
+									sanitized[tagName] = newTag
+								} else {
+									sanitized[tagName] = tagVal
+								}
+							}
+							newNative["template-tags"] = sanitized
+						} else {
+							newNative["template-tags"] = tags
+						}
 					}
 
 					// Build create payload
