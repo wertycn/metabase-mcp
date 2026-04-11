@@ -562,8 +562,10 @@ func registerCollectionTools(s *server.MCPServer, cfg *Config) {
 				mcp.Required(),
 				mcp.Description(`Collection ID, or "root" for the root collection.`),
 			),
-			mcp.WithString("model",
-				mcp.Description(`Optional filter — one of "card", "dashboard", "collection".`),
+			mcp.WithString("models",
+				mcp.Description(`Optional type filter, one value. Accepted values include `+
+					`"card", "dashboard", "collection", "dataset", "snippet", "timeline". `+
+					`Omit to return everything.`),
 			),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -572,9 +574,12 @@ func registerCollectionTools(s *server.MCPServer, cfg *Config) {
 				return errResult("collection_id is required"), nil
 			}
 
+			// Metabase's /collection/:id/items filter param is `models`
+			// (plural); the singular `model` is silently ignored. See
+			// src/metabase/collections_rest/api.clj defendpoint :get "/:id/items".
 			var params map[string]string
-			if model := req.GetString("model", ""); model != "" {
-				params = map[string]string{"model": model}
+			if models := req.GetString("models", ""); models != "" {
+				params = map[string]string{"models": models}
 			}
 
 			result, err := mbRequest(ctx, cfg, "GET", fmt.Sprintf("/collection/%s/items", collID), nil, params)
@@ -1308,10 +1313,13 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config, hasNamedInstances 
 				srcColID := int(toFloat64(srcRaw))
 				tgtColID := int(toFloat64(tgtIDs[i]))
 
-				// List cards in source collection
+				// List cards in source collection.
+				// Metabase expects `models` (plural); singular `model` is silently
+				// ignored and the endpoint returns everything. See
+				// src/metabase/collections_rest/api.clj defendpoint :get "/:id/items".
 				items, err := srcClient.Request(ctx, "GET",
 					fmt.Sprintf("/collection/%d/items", srcColID), nil,
-					map[string]string{"model": "card"})
+					map[string]string{"models": "card"})
 				if err != nil {
 					return errResult("list cards in collection %d: %v", srcColID, err), nil
 				}
@@ -1328,6 +1336,10 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config, hasNamedInstances 
 				for _, item := range cardItems {
 					itemMap, ok := item.(map[string]any)
 					if !ok {
+						continue
+					}
+					// Defensive: ensure the item really is a card.
+					if model, _ := itemMap["model"].(string); model != "card" {
 						continue
 					}
 					oldCardID := int(toFloat64(itemMap["id"]))
@@ -1456,10 +1468,10 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config, hasNamedInstances 
 				srcColID := int(toFloat64(srcRaw))
 				tgtColID := int(toFloat64(tgtIDs[i]))
 
-				// List dashboards in source collection
+				// List dashboards in source collection (parameter name is `models`, plural).
 				items, err := srcClient.Request(ctx, "GET",
 					fmt.Sprintf("/collection/%d/items", srcColID), nil,
-					map[string]string{"model": "dashboard"})
+					map[string]string{"models": "dashboard"})
 				if err != nil {
 					return errResult("list dashboards in collection %d: %v", srcColID, err), nil
 				}
@@ -1477,7 +1489,7 @@ func registerMigrationTools(s *server.MCPServer, cfg *Config, hasNamedInstances 
 					if !ok {
 						continue
 					}
-					// The API filter is not always reliable — verify the model field.
+					// Defensive: ensure the item really is a dashboard.
 					if model, _ := itemMap["model"].(string); model != "dashboard" {
 						continue
 					}
