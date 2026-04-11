@@ -590,6 +590,154 @@ func registerCollectionTools(s *server.MCPServer, cfg *Config) {
 		},
 	)
 
+	// get_collection_tree
+	s.AddTool(
+		mcp.NewTool("get_collection_tree",
+			mcp.WithDescription(
+				"Recursively walk a collection's sub-directories and report item counts at every level, "+
+					"grouped by type (card, dashboard, collection, dataset, ...). Each node includes "+
+					"`direct` counts (items directly inside that collection) and `recursive` counts "+
+					"(items anywhere below the node, including sub-collections themselves)."),
+			mcp.WithString("collection_id",
+				mcp.Required(),
+				mcp.Description(`Collection ID to start from. Use "root" for the root collection.`),
+			),
+			mcp.WithNumber("max_depth",
+				mcp.Description("Maximum recursion depth (the starting collection is depth 0). "+
+					"Omit or pass 0 for unlimited."),
+			),
+			mcp.WithString("instance",
+				mcp.Description(`Named Metabase instance (configured via METABASE_INSTANCES). `+
+					`Omit or pass empty to use the default instance.`),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			rootID := req.GetString("collection_id", "")
+			if rootID == "" {
+				return errResult("collection_id is required"), nil
+			}
+			maxDepth := req.GetInt("max_depth", 0)
+
+			instance := req.GetString("instance", "")
+			client, err := getInstanceClient(instance, cfg)
+			if err != nil {
+				client, err = getClient(ctx, cfg)
+				if err != nil {
+					return errResult("client: %v", err), nil
+				}
+			}
+
+			// newCounts returns a fresh counts map {total:0, by_type:{}}.
+			newCounts := func() map[string]any {
+				return map[string]any{
+					"total":   0,
+					"by_type": map[string]int{},
+				}
+			}
+			addTo := func(dst map[string]any, model string, n int) {
+				dst["total"] = dst["total"].(int) + n
+				bt := dst["by_type"].(map[string]int)
+				bt[model] += n
+			}
+			mergeInto := func(dst, src map[string]any) {
+				dst["total"] = dst["total"].(int) + src["total"].(int)
+				dstBT := dst["by_type"].(map[string]int)
+				for k, v := range src["by_type"].(map[string]int) {
+					dstBT[k] += v
+				}
+			}
+
+			// walk fetches items for one collection and recursively descends.
+			var walk func(id any, name string, depth int) (map[string]any, error)
+			walk = func(id any, name string, depth int) (map[string]any, error) {
+				items, err := client.Request(ctx, "GET",
+					fmt.Sprintf("/collection/%v/items", id), nil, nil)
+				if err != nil {
+					return nil, fmt.Errorf("list collection %v: %w", id, err)
+				}
+				var data []any
+				switch v := items.(type) {
+				case map[string]any:
+					data, _ = v["data"].([]any)
+				case []any:
+					data = v
+				}
+
+				direct := newCounts()
+				recursive := newCounts()
+				var children []map[string]any
+
+				// Classify items at this level, then recurse into sub-collections.
+				for _, it := range data {
+					im, ok := it.(map[string]any)
+					if !ok {
+						continue
+					}
+					model, _ := im["model"].(string)
+					if model == "" {
+						continue
+					}
+					addTo(direct, model, 1)
+
+					if model == "collection" && (maxDepth <= 0 || depth < maxDepth) {
+						childName, _ := im["name"].(string)
+						childNode, err := walk(im["id"], childName, depth+1)
+						if err != nil {
+							return nil, err
+						}
+						children = append(children, childNode)
+					}
+				}
+
+				// recursive = direct + sum of children.recursive.
+				mergeInto(recursive, direct)
+				for _, c := range children {
+					if cr, ok := c["recursive"].(map[string]any); ok {
+						mergeInto(recursive, cr)
+					}
+				}
+
+				node := map[string]any{
+					"id":        id,
+					"name":      name,
+					"depth":     depth,
+					"direct":    direct,
+					"recursive": recursive,
+				}
+				if len(children) > 0 {
+					node["children"] = children
+				}
+				// Mark nodes where we stopped descending due to max_depth but
+				// sub-collections were present, so the caller knows counts are partial.
+				if maxDepth > 0 && depth >= maxDepth {
+					if bt := direct["by_type"].(map[string]int); bt["collection"] > 0 {
+						node["truncated"] = true
+					}
+				}
+				return node, nil
+			}
+
+			// Resolve the starting collection's name for a nicer root label.
+			rootName := ""
+			if rootID == "root" {
+				rootName = "Our analytics"
+			} else {
+				if meta, err := client.Request(ctx, "GET",
+					fmt.Sprintf("/collection/%s", rootID), nil, nil); err == nil {
+					if mm, ok := meta.(map[string]any); ok {
+						rootName, _ = mm["name"].(string)
+					}
+				}
+			}
+
+			tree, err := walk(rootID, rootName, 0)
+			if err != nil {
+				return errResult("%v", err), nil
+			}
+			return jsonResult(tree)
+		},
+	)
+
 	// create_collection
 	s.AddTool(
 		mcp.NewTool("create_collection",
