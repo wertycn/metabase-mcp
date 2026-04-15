@@ -103,19 +103,36 @@ func saveQueryResult(cfg *Config, result any, toolName string, saveToFile bool, 
 		return jsonResult(result)
 	}
 
-	// ----- save full result to file -----
+	// ----- save full result to file (JSONL: one row per line) -----
 	if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
 	ts := time.Now().Format("20060102_150405")
-	filename := fmt.Sprintf("%s_%s.json", toolName, ts)
+	filename := fmt.Sprintf("%s_%s.jsonl", toolName, ts)
 	filePath := filepath.Join(cfg.OutputDir, filename)
 
-	fullJSON, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal full result: %w", err)
+	// First line: column names array; subsequent lines: value arrays.
+	cols, _ := data["cols"].([]any)
+	colNames := make([]string, len(cols))
+	for i, c := range cols {
+		if cm, ok := c.(map[string]any); ok {
+			colNames[i], _ = cm["name"].(string)
+		}
 	}
-	if err := os.WriteFile(filePath, fullJSON, 0o644); err != nil {
+
+	var sb strings.Builder
+	header, _ := json.Marshal(colNames)
+	sb.Write(header)
+	sb.WriteByte('\n')
+	for _, row := range rows {
+		line, err := json.Marshal(row)
+		if err != nil {
+			continue
+		}
+		sb.Write(line)
+		sb.WriteByte('\n')
+	}
+	if err := os.WriteFile(filePath, []byte(sb.String()), 0o644); err != nil {
 		return nil, fmt.Errorf("write result file: %w", err)
 	}
 
