@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -75,6 +78,91 @@ func mbRequest(ctx context.Context, cfg *Config, method, path string, body any, 
 		return nil, err
 	}
 	return client.Request(ctx, method, path, body, params)
+}
+
+// saveQueryResult saves the full result to a JSON file and returns a
+// (possibly truncated) CallToolResult. When the result contains data rows
+// exceeding previewRows, or when saveToFile is true, the full payload is
+// written to cfg.OutputDir and the MCP response only includes previewRows
+// rows plus a pointer to the file.
+//
+// previewRows controls how many rows are returned to the AI; it is
+// independent of any SQL LIMIT the user may have used.
+func saveQueryResult(cfg *Config, result any, toolName string, saveToFile bool, previewRows int) (*mcp.CallToolResult, error) {
+	// Extract rows from the standard Metabase query result shape:
+	// { "data": { "rows": [...], ... }, ... }
+	m, _ := result.(map[string]any)
+	data, _ := m["data"].(map[string]any)
+	rows, _ := data["rows"].([]any)
+
+	totalRows := len(rows)
+	needSave := saveToFile || totalRows > previewRows
+
+	if !needSave {
+		// Small result — return everything inline, no file.
+		return jsonResult(result)
+	}
+
+	// ----- save full result to file -----
+	if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create output dir: %w", err)
+	}
+	ts := time.Now().Format("20060102_150405")
+	filename := fmt.Sprintf("%s_%s.json", toolName, ts)
+	filePath := filepath.Join(cfg.OutputDir, filename)
+
+	fullJSON, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal full result: %w", err)
+	}
+	if err := os.WriteFile(filePath, fullJSON, 0o644); err != nil {
+		return nil, fmt.Errorf("write result file: %w", err)
+	}
+
+	absPath, _ := filepath.Abs(filePath)
+
+	// ----- build truncated preview -----
+	preview := deepCopyMap(m)
+	previewData := preview["data"].(map[string]any)
+	if totalRows > previewRows {
+		previewData["rows"] = rows[:previewRows]
+	}
+	preview["_result_saved_to"] = absPath
+	preview["_total_rows"] = totalRows
+	preview["_preview_rows"] = previewRows
+	if totalRows > previewRows {
+		preview["_note"] = fmt.Sprintf(
+			"Showing first %d of %d rows. Full data saved to: %s",
+			previewRows, totalRows, absPath,
+		)
+	} else {
+		preview["_note"] = fmt.Sprintf(
+			"All %d rows saved to: %s",
+			totalRows, absPath,
+		)
+	}
+
+	return jsonResult(preview)
+}
+
+// deepCopyMap creates a shallow copy of a map[string]any, also shallow-copying
+// the "data" sub-map so we can safely mutate "rows" without touching the original.
+func deepCopyMap(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		if k == "data" {
+			if dm, ok := v.(map[string]any); ok {
+				dataCopy := make(map[string]any, len(dm))
+				for dk, dv := range dm {
+					dataCopy[dk] = dv
+				}
+				dst[k] = dataCopy
+				continue
+			}
+		}
+		dst[k] = v
+	}
+	return dst
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +286,9 @@ func registerDatabaseTools(s *server.MCPServer, cfg *Config) {
 func registerQueryTools(s *server.MCPServer, cfg *Config) {
 	s.AddTool(
 		mcp.NewTool("execute_query",
-			mcp.WithDescription("Execute a native SQL query against a Metabase database."),
+			mcp.WithDescription("Execute a native SQL query against a Metabase database. "+
+				"When the result exceeds preview_rows (default 10), the full data is automatically saved to a JSON file "+
+				"and only a preview is returned. Use save_to_file=true to always save regardless of row count."),
 			mcp.WithNumber("database_id",
 				mcp.Required(),
 				mcp.Description("The numeric ID of the database to query."),
@@ -209,6 +299,13 @@ func registerQueryTools(s *server.MCPServer, cfg *Config) {
 			),
 			mcp.WithArray("native_parameters",
 				mcp.Description("Optional list of Metabase native query parameters."),
+			),
+			mcp.WithBoolean("save_to_file",
+				mcp.Description("Force saving full results to a JSON file regardless of row count. Default false."),
+			),
+			mcp.WithNumber("preview_rows",
+				mcp.Description("Number of rows to return in the MCP response when results are saved to file. Default 10. Independent of SQL LIMIT."),
+				mcp.DefaultNumber(10),
 			),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -221,8 +318,11 @@ func registerQueryTools(s *server.MCPServer, cfg *Config) {
 				return errResult("query is required"), nil
 			}
 
-			native := map[string]any{"query": query}
+			previewRows := req.GetInt("preview_rows", 10)
 			args := req.GetArguments()
+			saveToFile, _ := args["save_to_file"].(bool)
+
+			native := map[string]any{"query": query}
 			if params, ok := args["native_parameters"]; ok && params != nil {
 				native["parameters"] = params
 			}
@@ -237,7 +337,7 @@ func registerQueryTools(s *server.MCPServer, cfg *Config) {
 			if err != nil {
 				return errResult("%v", err), nil
 			}
-			return jsonResult(result)
+			return saveQueryResult(cfg, result, "execute_query", saveToFile, previewRows)
 		},
 	)
 }
@@ -410,13 +510,22 @@ func registerCardTools(s *server.MCPServer, cfg *Config) {
 	// execute_card
 	s.AddTool(
 		mcp.NewTool("execute_card",
-			mcp.WithDescription("Execute a saved Metabase question/card and return results."),
+			mcp.WithDescription("Execute a saved Metabase question/card and return results. "+
+				"When the result exceeds preview_rows (default 10), the full data is automatically saved to a JSON file "+
+				"and only a preview is returned. Use save_to_file=true to always save regardless of row count."),
 			mcp.WithNumber("card_id",
 				mcp.Required(),
 				mcp.Description("The numeric ID of the card."),
 			),
 			mcp.WithArray("parameters",
 				mcp.Description("Optional list of dashboard filter parameters."),
+			),
+			mcp.WithBoolean("save_to_file",
+				mcp.Description("Force saving full results to a JSON file regardless of row count. Default false."),
+			),
+			mcp.WithNumber("preview_rows",
+				mcp.Description("Number of rows to return in the MCP response when results are saved to file. Default 10. Independent of SQL LIMIT."),
+				mcp.DefaultNumber(10),
 			),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -425,8 +534,11 @@ func registerCardTools(s *server.MCPServer, cfg *Config) {
 				return errResult("card_id is required"), nil
 			}
 
+			previewRows := req.GetInt("preview_rows", 10)
+
 			payload := map[string]any{}
 			args := req.GetArguments()
+			saveToFile, _ := args["save_to_file"].(bool)
 			if params, ok := args["parameters"]; ok && params != nil {
 				payload["parameters"] = params
 			}
@@ -435,7 +547,7 @@ func registerCardTools(s *server.MCPServer, cfg *Config) {
 			if err != nil {
 				return errResult("%v", err), nil
 			}
-			return jsonResult(result)
+			return saveQueryResult(cfg, result, fmt.Sprintf("execute_card_%d", cardID), saveToFile, previewRows)
 		},
 	)
 

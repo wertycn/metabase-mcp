@@ -3,6 +3,7 @@ package main
 import (
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -31,6 +32,9 @@ type Config struct {
 	// Transport mode: "stdio" or "http"
 	Transport string
 
+	// OutputDir is the directory where query result JSON files are saved.
+	OutputDir string
+
 	// Named Metabase instances for multi-instance scenarios (e.g. migration).
 	// Key is the instance identifier (e.g. "hz", "sg").
 	// The default instance (from METABASE_URL) is stored under key "default".
@@ -52,6 +56,8 @@ func loadConfig() *Config {
 		MCPPath:           getEnv("MCP_PATH", "/mcp"),
 		ClientCacheTTL:    ttl,
 	}
+
+	cfg.OutputDir = getEnv("OUTPUT_DIR", filepath.Join(os.TempDir(), "metabase-mcp-output"))
 
 	// METABASE_CREDENTIALS accepts base64url-encoded "user:pass" or "apikey:<key>",
 	// the same format used for URL path encoding.
