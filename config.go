@@ -1,11 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Config holds all server-level configuration loaded from environment variables.
@@ -42,6 +45,8 @@ type Config struct {
 }
 
 func loadConfig() *Config {
+	loadConfigFile()
+
 	port, _ := strconv.Atoi(getEnv("PORT", "8000"))
 	ttl, _ := strconv.Atoi(getEnv("CLIENT_CACHE_TTL", "3600"))
 
@@ -139,8 +144,119 @@ func loadConfig() *Config {
 	return cfg
 }
 
+// ---------------------------------------------------------------------------
+// Config file support
+// ---------------------------------------------------------------------------
+
+// fileDefaults holds values loaded from the YAML config file.
+// getEnv checks this map as a fallback when the environment variable is unset.
+var fileDefaults map[string]string
+
+// configFile is the YAML config file structure.
+type configFile struct {
+	MetabaseURL         string                   `yaml:"metabase_url"`
+	MetabaseCredentials string                   `yaml:"metabase_credentials"`
+	MetabaseAPIKey      string                   `yaml:"metabase_api_key"`
+	MetabaseUserEmail   string                   `yaml:"metabase_user_email"`
+	MetabasePassword    string                   `yaml:"metabase_password"`
+	MetabaseHTTPProxy   string                   `yaml:"metabase_http_proxy"`
+	Transport           string                   `yaml:"transport"`
+	Host                string                   `yaml:"host"`
+	Port                int                      `yaml:"port"`
+	MCPPath             string                   `yaml:"mcp_path"`
+	ClientCacheTTL      int                      `yaml:"client_cache_ttl"`
+	OutputDir           string                   `yaml:"output_dir"`
+	Instances           map[string]*instanceFile `yaml:"instances"`
+}
+
+type instanceFile struct {
+	URL         string `yaml:"url"`
+	Credentials string `yaml:"credentials"`
+	APIKey      string `yaml:"api_key"`
+	Email       string `yaml:"email"`
+	Password    string `yaml:"password"`
+}
+
+// configFilePath returns the path to the config file to load.
+// Priority: CONFIG_FILE env var > ~/.config/metabase-mcp/config.yaml.
+func configFilePath() string {
+	if p := os.Getenv("CONFIG_FILE"); p != "" {
+		return p
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "metabase-mcp", "config.yaml")
+}
+
+// loadConfigFile reads the YAML config file and populates fileDefaults.
+// It is called once at the start of loadConfig.
+func loadConfigFile() {
+	fileDefaults = make(map[string]string)
+
+	path := configFilePath()
+	if path == "" {
+		return
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // file not found is fine
+	}
+
+	var fc configFile
+	if err := yaml.Unmarshal(data, &fc); err != nil {
+		slog.Warn("Failed to parse config file", "path", path, "err", err)
+		return
+	}
+
+	slog.Info("Loaded config file", "path", path)
+
+	setFileDef("METABASE_URL", fc.MetabaseURL)
+	setFileDef("METABASE_CREDENTIALS", fc.MetabaseCredentials)
+	setFileDef("METABASE_API_KEY", fc.MetabaseAPIKey)
+	setFileDef("METABASE_USER_EMAIL", fc.MetabaseUserEmail)
+	setFileDef("METABASE_PASSWORD", fc.MetabasePassword)
+	setFileDef("METABASE_HTTP_PROXY", fc.MetabaseHTTPProxy)
+	setFileDef("TRANSPORT", fc.Transport)
+	setFileDef("HOST", fc.Host)
+	if fc.Port != 0 {
+		setFileDef("PORT", strconv.Itoa(fc.Port))
+	}
+	setFileDef("MCP_PATH", fc.MCPPath)
+	if fc.ClientCacheTTL != 0 {
+		setFileDef("CLIENT_CACHE_TTL", strconv.Itoa(fc.ClientCacheTTL))
+	}
+	setFileDef("OUTPUT_DIR", fc.OutputDir)
+
+	if len(fc.Instances) > 0 {
+		names := make([]string, 0, len(fc.Instances))
+		for name, inst := range fc.Instances {
+			names = append(names, name)
+			prefix := fmt.Sprintf("METABASE_%s_", strings.ToUpper(name))
+			setFileDef(prefix+"URL", inst.URL)
+			setFileDef(prefix+"CREDENTIALS", inst.Credentials)
+			setFileDef(prefix+"API_KEY", inst.APIKey)
+			setFileDef(prefix+"EMAIL", inst.Email)
+			setFileDef(prefix+"PASSWORD", inst.Password)
+		}
+		setFileDef("METABASE_INSTANCES", strings.Join(names, ","))
+	}
+}
+
+func setFileDef(key, value string) {
+	if value != "" {
+		fileDefaults[key] = value
+	}
+}
+
+// getEnv returns the value for key with priority: env var > config file > defaultVal.
 func getEnv(key, defaultVal string) string {
 	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	if v, ok := fileDefaults[key]; ok && v != "" {
 		return v
 	}
 	return defaultVal

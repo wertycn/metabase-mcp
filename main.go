@@ -14,6 +14,12 @@ import (
 var version = "dev"
 
 func main() {
+	// Subcommand: "download" enters CLI export mode.
+	if len(os.Args) >= 2 && os.Args[1] == "download" {
+		runCLI(os.Args[2:])
+		return
+	}
+
 	transport := flag.String(
 		"transport",
 		getEnv("TRANSPORT", "http"),

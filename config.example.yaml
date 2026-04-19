@@ -1,0 +1,54 @@
+# Metabase MCP Server 配置文件
+#
+# 配置文件位置（按平台）:
+#   Linux   : ~/.config/metabase-mcp/config.yaml
+#   macOS   : ~/Library/Application Support/metabase-mcp/config.yaml
+#   Windows : %AppData%/metabase-mcp/config.yaml
+#
+# 也可通过 CONFIG_FILE 环境变量指定路径:
+#   CONFIG_FILE=/path/to/config.yaml metabase-mcp
+#
+# 优先级: 环境变量 > 配置文件 > 内置默认值
+# 所有配置项均可通过同名环境变量覆盖（大写，如 METABASE_URL）。
+
+# ── Metabase 连接 ────────────────────────────────────────────────────────────
+metabase_url: https://metabase.example.com
+
+# ── 认证方式（三选一） ───────────────────────────────────────────────────────
+#
+# 方式 A: base64url 编码凭据（推荐，避免明文）
+#   生成方法:
+#     API Key  : echo -n 'apikey:mb_xxxx'             | base64 | tr '+/' '-_' | tr -d '='
+#     账号密码 : echo -n 'alice@example.com:password' | base64 | tr '+/' '-_' | tr -d '='
+# metabase_credentials: YXBpa2V5Om1iX3h4eHg
+#
+# 方式 B: API Key 明文
+metabase_api_key: mb_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#
+# 方式 C: 邮箱 + 密码明文
+# metabase_user_email: admin@example.com
+# metabase_password: your-password
+
+# ── HTTP 代理 ─────────────────────────────────────────────────────────────────
+# 仅当显式设置时才启用；不设置则忽略系统 HTTP_PROXY/HTTPS_PROXY。
+# metabase_http_proxy: http://proxy.internal:3128
+
+# ── 传输模式 & HTTP 服务 ─────────────────────────────────────────────────────
+transport: stdio              # stdio | http
+# host: 0.0.0.0              # http 模式监听地址
+# port: 8000                 # http 模式监听端口
+# mcp_path: /mcp             # MCP 端点路径
+# client_cache_ttl: 3600     # 客户端连接缓存 TTL（秒）
+
+# ── 输出目录（查询结果/CLI 下载） ────────────────────────────────────────────
+output_dir: ~/metabase-data
+
+# ── 多实例（跨实例迁移用） ───────────────────────────────────────────────────
+# instances:
+#   hz:
+#     url: https://metabase-hz.example.com
+#     api_key: mb_hz_xxxx
+#   sg:
+#     url: https://metabase-sg.example.com
+#     email: admin@sg.example.com
+#     password: sg-password
